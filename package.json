@@ -1,0 +1,54 @@
+{
+  "name": "jev-router",
+  "version": "0.1.0",
+  "description": "Agent- and harness-agnostic router that offloads parallel-workstream decisions to TypeSafe's Jev System One model (POST https://api.typesafe.ai/v1/systemone): speculative fan-out, routing, review, batch triage, and Box image localization. Ships as a zero-dependency MCP server, a CLI, a native Vibe plugin, and a Claude Code plugin.",
+  "license": "MIT",
+  "author": {
+    "name": "Christopher Marchant",
+    "url": "https://github.com/chrismarchant"
+  },
+  "homepage": "https://github.com/chrismarchant/jev-router",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/chrismarchant/jev-router.git"
+  },
+  "bin": {
+    "jev-router": "bin/jev-router.js"
+  },
+  "main": "mcp-server/client.js",
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "verify": "bash scripts/verify.sh"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "typesafe",
+    "jev",
+    "system-one",
+    "mcp",
+    "router",
+    "fan-out",
+    "agents",
+    "plugin",
+    "claude-code",
+    "vibe",
+    "skills"
+  ],
+  "files": [
+    "bin/",
+    "mcp-server/",
+    "skills/",
+    "commands/",
+    "agents/",
+    "scripts/",
+    "examples/",
+    "plugin.json",
+    "mcp.json",
+    ".mcp.json",
+    ".claude-plugin/",
+    "README.md",
+    "LICENSE"
+  ]
+}

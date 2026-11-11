@@ -1,0 +1,13 @@
+{
+  "name": "jev-router",
+  "description": "Route parallel-workstream decisions to TypeSafe's Jev System One model (speculative fan-out, routing, review, batch, Box) via a bundled zero-dependency MCP server. Agent- and harness-agnostic: also installs as a Vibe plugin (plugin.json/mcp.json) or via the CLI (bin/jev-router.js).",
+  "version": "0.1.0",
+  "author": {
+    "name": "Christopher Marchant",
+    "github": "chrismarchant"
+  },
+  "license": "MIT",
+  "commands": ["./commands/parallel-jev.md"],
+  "agents": ["./agents/workstream-planner.md"],
+  "skills": ["./skills/jev-router/SKILL.md"]
+}

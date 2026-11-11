@@ -1,0 +1,7 @@
+[
+  { "id": "limiter", "description": "Implement the token-bucket rate limiter in src/rate-limit.js" },
+  { "id": "config", "description": "Add rate-limit config keys and environment variables" },
+  { "id": "wire-up", "description": "Wire the limiter into the request pipeline in src/server.js" },
+  { "id": "tests", "description": "Unit + integration tests for the limiter and 429 responses" },
+  { "id": "docs", "description": "Update API docs with rate-limit headers and 429 behavior" }
+]

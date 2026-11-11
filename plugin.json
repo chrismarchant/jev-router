@@ -1,0 +1,20 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "jev-router",
+  "version": "0.1.0",
+  "description": "Route parallel-workstream decisions to TypeSafe's Jev System One model (speculative fan-out, routing, review, batch triage, Box image localization) via a bundled zero-dependency MCP server plus a CLI. Works in Mistral Vibe and any Agent Plugins 1.0 harness.",
+  "author": {
+    "name": "Christopher Marchant",
+    "url": "https://github.com/chrismarchant"
+  },
+  "homepage": "https://github.com/chrismarchant/jev-router",
+  "repository": "https://github.com/chrismarchant/jev-router",
+  "license": "MIT",
+  "keywords": ["typesafe", "jev", "system-one", "mcp", "router", "fan-out", "agents", "vibe"],
+  "extensions": {
+    "ai.mistral.vibe": {
+      "schemaVersion": 1,
+      "displayName": "Jev Router"
+    }
+  }
+}

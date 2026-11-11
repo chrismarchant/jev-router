@@ -1,0 +1,1 @@
+Add per-user rate limiting to the public API: a token-bucket limiter in src/rate-limit.js, config + env vars, tests, and updated API docs.

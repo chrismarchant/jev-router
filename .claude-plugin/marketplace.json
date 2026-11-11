@@ -1,0 +1,17 @@
+{
+  "name": "jev-router-marketplace",
+  "owner": {
+    "name": "Christopher Marchant",
+    "github": "chrismarchant"
+  },
+  "description": "Marketplace for the jev-router plugin: offload parallel-workstream decisions to the TypeSafe Jev System One model from any agent (Claude Code, Vibe, Codex, or plain CLI).",
+  "plugins": [
+    {
+      "name": "jev-router",
+      "source": "./",
+      "description": "Routes parallel agent workstreams through the Jev System One model (fan-out, routing, review, batch, Box) via a bundled zero-dependency MCP server + CLI.",
+      "version": "0.1.0",
+      "license": "MIT"
+    }
+  ]
+}

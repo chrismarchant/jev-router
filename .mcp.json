@@ -1,0 +1,19 @@
+{
+  "mcpServers": {
+    "jev-router": {
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/mcp-server/server.js"],
+      "env": {
+        "TYPESAFE_API_KEY": "${TYPESAFE_API_KEY}",
+        "TYPESAFE_API_BASE": "${TYPESAFE_API_BASE:-https://api.typesafe.ai}",
+        "TYPESAFE_MODEL": "${TYPESAFE_MODEL:-jev-latest}",
+        "JEV_ROUTER_TIMEOUT_MS": "${JEV_ROUTER_TIMEOUT_MS:-60000}",
+        "JEV_ROUTER_MAX_RETRIES": "${JEV_ROUTER_MAX_RETRIES:-3}",
+        "JEV_ROUTER_CONCURRENCY": "${JEV_ROUTER_CONCURRENCY:-6}",
+        "JEV_ROUTER_ALLOW_IMAGES": "${JEV_ROUTER_ALLOW_IMAGES:-true}",
+        "JEV_ROUTER_MAX_CANDIDATES": "${JEV_ROUTER_MAX_CANDIDATES:-24}",
+        "MAX_CONTEXT_CHARS": "${MAX_CONTEXT_CHARS:-200000}"
+      }
+    }
+  }
+}

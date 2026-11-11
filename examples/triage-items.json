@@ -1,0 +1,29 @@
+[
+  {
+    "id": "ticket-1",
+    "state": "My invoice shows two charges for order A-104. Please refund the duplicate.",
+    "questions": {
+      "category": { "type": "choice", "instructions": "What is this ticket about?", "criteria": { "billing": "Charges, invoices, refunds, payments", "technical": "Bugs or integration problems", "other": "Anything else" } },
+      "refund_requested": { "type": "noul", "instructions": "Is a refund explicitly requested?" },
+      "urgent": { "type": "noul", "instructions": "Does the message convey urgency or time-sensitivity?" }
+    }
+  },
+  {
+    "id": "ticket-2",
+    "state": "The /v1/search endpoint returns 500 since yesterday's deploy. Steps to reproduce included.",
+    "questions": {
+      "category": { "type": "choice", "instructions": "What is this ticket about?", "criteria": { "billing": "Charges, invoices, refunds, payments", "technical": "Bugs or integration problems", "other": "Anything else" } },
+      "refund_requested": { "type": "noul", "instructions": "Is a refund explicitly requested?" },
+      "urgent": { "type": "noul", "instructions": "Does the message convey urgency or time-sensitivity?" }
+    }
+  },
+  {
+    "id": "ticket-3",
+    "state": "Hi! Do you offer annual billing with a discount?",
+    "questions": {
+      "category": { "type": "choice", "instructions": "What is this ticket about?", "criteria": { "billing": "Charges, invoices, refunds, payments", "technical": "Bugs or integration problems", "other": "Anything else" } },
+      "refund_requested": { "type": "noul", "instructions": "Is a refund explicitly requested?" },
+      "urgent": { "type": "noul", "instructions": "Does the message convey urgency or time-sensitivity?" }
+    }
+  }
+]
