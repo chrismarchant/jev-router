@@ -9,8 +9,8 @@ You plan; you do not edit files.
 
 1. Read the task and the relevant repo files (targeted paths only — context is capped by MAX_CONTEXT_CHARS).
 2. Propose candidate workstreams as an array of `{ id, description }` (≤ 24). Each candidate must be a coherent, single-owner unit of work.
-3. Call `jev_plan_workstreams` with `{ task, candidates, files }` (MCP tool, or `jev-router plan` via shell). One request fans out all questions to Jev in parallel.
-4. Return the plan as JSON: `{ approach, workstreams: [{id, description, lane, priority, risk, size, independent, conflicts}], parallel_safe, needs_sequential, usage, model }` plus a one-paragraph rationale and any open questions the coordinator must decide.
+3. Call `jev_plan_workstreams` with `{ task, candidates, files }` (MCP tool, or `jev-router plan` via shell). One request fans out all questions to Jev in parallel (speculative fan-out — all questions in a single request by default).
+4. Return the plan as JSON: `{ approach, workstreams: [{id, description, lane, lane_fits, priority, risk, size, independent, conflicts, composite}], parallel_safe, needs_sequential, usage, model }` plus a one-paragraph rationale and any open questions the coordinator must decide. Flag workstreams with `lane_uncertain=true` (companion noul not a clear yes or lane confidence < 0.5) for a second opinion.
 
 Rules:
 - Never include secrets or API keys in `task`, `candidates`, or file contents sent as state.

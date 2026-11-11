@@ -6,15 +6,39 @@
  * questions (noul / choice / score / box) about a `state`, so the host agent
  * keeps doing the work and Jev decides what/where/how urgent/how to verify.
  *
- * Docs: https://docs.typesafe.ai/patterns/fan-out.md (speculative fan-out),
- *       https://docs.typesafe.ai/primitives/box.md
+ * Behavior is encoded from the TypeSafe docs:
+ * - Speculative fan-out is the DEFAULT: every question that shares a state
+ *   goes in ONE request (there is no question-count limit, only context
+ *   limits — 64k tokens per-request / 32k per-question). Extra questions are
+ *   evaluated in parallel and discarded in code.
+ *   https://docs.typesafe.ai/patterns/fan-out.md
+ * - Companion Noul beside every Choice (route / plan / box).
+ *   https://docs.typesafe.ai/patterns/companion-noul.md
+ * - Probability-routing (threshold on the probability of the option you act
+ *   on) + confidence-routing (check confidence first; below the floor,
+ *   escalate). https://docs.typesafe.ai/patterns/probability-routing.md
+ * - Noul three-band reading: >0.7 yes, <0.3 no, in between its own outcome
+ *   (Nouls carry no separate `confidence`; |2p-1| puts them on the same
+ *   0..1 scale if needed). https://docs.typesafe.ai/confidence.md
+ * - Composite scoring: atomic scores combined with weights in code (plan).
+ *   https://docs.typesafe.ai/patterns/composite-scoring.md
+ * - Jev limitations (AI primer + model jaggedness): Jev never generates text,
+ *   is not a calculator (no math/counting/date comparison), reads literally,
+ *   suffers context rot with irrelevant state, and Choice option order can
+ *   bias answers. So: filter state in code, reference fields by name, never
+ *   ask Jev to compute, and draft closed option sets with a small generative
+ *   LLM (jev_draft_options, default mistral-small-latest) — Jev only picks.
  */
 
 const fs = require('node:fs');
 const path = require('node:path');
 const { noul, choice, score, box, normalizeQuestions, validateQuestions } = require('./questions');
 
-const MAX_CONTEXT_CHARS = parseInt(process.env.MAX_CONTEXT_CHARS || '200000', 10);
+// Jev context limits: 64k tokens per-request / 32k per-question, and `state`
+// counts against BOTH. ~4 chars/token, so keep state well under 32k tokens.
+// Raise via JEV_ROUTER_LONG_CONTEXT=true (TypeSafe-Danger-Zone-Long-Context
+// header -> 262k, but slower and less accurate).
+const MAX_CONTEXT_CHARS = parseInt(process.env.MAX_CONTEXT_CHARS || '120000', 10);
 const DEFAULT_MAX_CANDIDATES = parseInt(process.env.JEV_ROUTER_MAX_CANDIDATES || '24', 10);
 const DEFAULT_CONCURRENCY = Math.min(16, Math.max(1, parseInt(process.env.JEV_ROUTER_CONCURRENCY || '6', 10)));
 
@@ -51,6 +75,18 @@ const SIZE_LEVELS = [
   '3 — large (multi-day)',
   '4 — epic (should be split further)',
 ];
+
+// Noul reading bands (docs.typesafe.ai/primitives/noul + confidence).
+const NOUL_YES_ABOVE = 0.7;
+const NOUL_NO_BELOW = 0.3;
+// Confidence floor (docs.typesafe.ai/patterns/confidence-routing.md): below
+// this, do not act — escalate.
+const CONFIDENCE_FLOOR = 0.5;
+
+function noulBand(p) {
+  if (p === null || p === undefined) return null;
+  return p > NOUL_YES_ABOVE ? 'clear_yes' : p < NOUL_NO_BELOW ? 'clear_no' : 'uncertain';
+}
 
 /* ---------- helpers ---------- */
 
@@ -119,6 +155,11 @@ async function hModels(args, client) {
     endpoint: `${client.apiBase}/v1/models`,
     default_model: client.defaultModel,
     models,
+    limits_note:
+      'Jev context limits: 64k tokens per-request AND 32k per-question (state counts against both). ' +
+      'Long context (262k) needs TypeSafe-Danger-Zone-Long-Context: true (JEV_ROUTER_LONG_CONTEXT=true) but is slower and less accurate. ' +
+      'Box questions need Jev 1.14+. Aliases (jev-latest) move between releases — the response "model" field has the versioned ID; pin it if you tuned thresholds. ' +
+      'Input is billed per token (~$0.042/M); output tokens are free.',
   };
 }
 
@@ -146,12 +187,17 @@ async function hFanOut(args, client) {
     headers: args.headers,
     timeoutMs: args.timeout_ms,
   });
-  // Speculative fan-out: every question is answered in parallel in one request;
-  // the caller (or this tool) discards answers it does not need afterwards.
+  // Speculative fan-out: ONE request, all questions evaluated in parallel; the
+  // caller (or this tool) discards the answers it does not need afterwards.
   const discarded = [];
   if (minConfidence !== null) {
     for (const [id, a] of Object.entries(res.answers || {})) {
-      const conf = a && typeof a.confidence === 'number' ? a.confidence : null;
+      let conf = a && typeof a.confidence === 'number' ? a.confidence : null;
+      // Nouls carry no confidence; |2p-1| puts the noul on the same 0..1 scale
+      // (docs.typesafe.ai/confidence.md) when noul_confidence is enabled.
+      if (conf === null && args.noul_confidence === true && a && a.type === 'noul' && typeof a.noul === 'number') {
+        conf = Math.abs(2 * a.noul - 1);
+      }
       if (conf !== null && conf < minConfidence) discarded.push({ id, confidence: conf });
     }
   }
@@ -161,7 +207,7 @@ async function hFanOut(args, client) {
     usage: res.usage,
     question_count: Object.keys(questions).length,
     discarded_below_confidence: discarded,
-    note: 'One request, all questions evaluated in parallel. Answers you do not need are simply ignored in code.',
+    note: 'One request, all questions evaluated in parallel (no question-count limit — only context limits). Answers you do not need are simply ignored in code.',
   };
 }
 
@@ -175,6 +221,11 @@ async function hPlan(args, client) {
     throw new TypeError(`Too many candidates (${args.candidates.length}); max is ${maxCandidates} (set max_candidates / JEV_ROUTER_MAX_CANDIDATES).`);
   }
   const lanes = args.lanes && typeof args.lanes === 'object' && Object.keys(args.lanes).length > 0 ? args.lanes : DEFAULT_LANES;
+  // Composite-scoring weights (docs.typesafe.ai/patterns/composite-scoring.md):
+  // atomic scores normalized to 0..1, combined with weights in code.
+  const weights = args.weights && typeof args.weights === 'object'
+    ? { priority: num(args.weights.priority, 1), risk: num(args.weights.risk, -1), size: num(args.weights.size, 0) }
+    : { priority: 1, risk: -1, size: 0 };
 
   const candidates = args.candidates.map((c, i) => {
     if (typeof c === 'string') return { id: sanitizeId(`ws${i + 1}`, `ws${i + 1}`), description: c };
@@ -183,7 +234,6 @@ async function hPlan(args, client) {
     }
     throw new TypeError(`candidates[${i}] must be a string or { id?, description }.`);
   });
-  // guarantee unique ids
   const seen = new Set();
   for (const c of candidates) {
     let id = c.id, n = 2;
@@ -192,23 +242,28 @@ async function hPlan(args, client) {
     c.id = id;
   }
 
+  // ONE request, all questions in parallel (speculative fan-out). Instructions
+  // reference state fields by name/path (jaggedness: avoid indirection).
   const questions = {
-    approach: choice('Should this task be executed as parallel workstreams, sequentially, or a hybrid (some workstreams in parallel, some after others)?', {
+    approach: choice('Should this task be executed as parallel workstreams, sequentially, or a hybrid?', {
       parallel: 'The workstreams are independent enough to run all at once',
       sequential: 'Workstreams depend on each other and must run one after another',
       hybrid: 'Some workstreams can run in parallel; others must wait',
     }),
-    task_complexity: score('How complex is the overall task?', RISK_LEVELS),
+    task_complexity: score('How complex is the overall task `task`?', RISK_LEVELS),
   };
-  for (const c of candidates) {
+  candidates.forEach((c, i) => {
     const id = c.id;
-    questions[`${id}__lane`] = choice(`Which lane best fits this workstream: "${c.description}"?`, lanes);
-    questions[`${id}__priority`] = score(`How important/urgent is this workstream for the overall task: "${c.description}"?`, PRIORITY_LEVELS);
-    questions[`${id}__risk`] = score(`How risky is this workstream (chance of breaking or conflicting with other parts): "${c.description}"?`, RISK_LEVELS);
-    questions[`${id}__size`] = score(`How big is this workstream: "${c.description}"?`, SIZE_LEVELS);
-    questions[`${id}__independent`] = noul(`Is this workstream independent — can it run in parallel without waiting for any other workstream's output: "${c.description}"?`);
-    questions[`${id}__conflicts`] = noul(`Does this workstream modify or depend on files/code that another listed workstream also modifies (merge-conflict risk): "${c.description}"?`);
-  }
+    const ref = `\`candidates[${i}].description\``;
+    questions[`${id}__lane`] = choice(`Which lane best fits the workstream described at ${ref}?`, lanes);
+    // companion noul: a Choice always picks one — this says whether any lane fits
+    questions[`${id}__lane_fits`] = noul(`Does at least one of the lanes fit the workstream described at ${ref}?`);
+    questions[`${id}__priority`] = score(`How important/urgent is the workstream at ${ref} for the overall task \`task\`?`, PRIORITY_LEVELS);
+    questions[`${id}__risk`] = score(`How risky is the workstream at ${ref} (chance of breaking or conflicting with other parts)?`, RISK_LEVELS);
+    questions[`${id}__size`] = score(`How big is the workstream at ${ref}?`, SIZE_LEVELS);
+    questions[`${id}__independent`] = noul(`Is the workstream at ${ref} independent — can it run in parallel without waiting for any other workstream in \`candidates\`?`);
+    questions[`${id}__conflicts`] = noul(`Does the workstream at ${ref} modify or depend on files/code that another entry in \`candidates\` also modifies (merge-conflict risk)?`);
+  });
 
   const state = {
     task: args.task,
@@ -219,74 +274,100 @@ async function hPlan(args, client) {
 
   const res = await client.systemOne({ model: args.model, state, questions, timeoutMs: args.timeout_ms });
   const answers = res.answers || {};
+  const norm = (v, max) => (typeof v === 'number' ? v / max : null);
 
-  const workstreams = candidates.map((c) => {
+  const workstreams = candidates.map((c, i) => {
     const lane = answers[`${c.id}__lane`];
+    const laneFits = answers[`${c.id}__lane_fits`];
     const priority = answers[`${c.id}__priority`];
     const risk = answers[`${c.id}__risk`];
     const size = answers[`${c.id}__size`];
     const independent = answers[`${c.id}__independent`];
     const conflicts = answers[`${c.id}__conflicts`];
+    const p = priority ? priority.score : null;
+    const r = risk ? risk.score : null;
+    const s = size ? size.score : null;
+    const laneConfidence = lane && typeof lane.confidence === 'number' ? lane.confidence : null;
+    const fits = laneFits ? laneFits.noul : null;
+    const parts = [weights.priority * (norm(p, 3) ?? 0), weights.risk * (norm(r, 4) ?? 0), weights.size * (norm(s, 4) ?? 0)];
+    const composite = (p === null && r === null && s === null) ? null : parts.reduce((a, b) => a + b, 0);
     return {
       id: c.id,
       description: c.description,
       lane: lane ? lane.choice : null,
-      lane_confidence: lane && typeof lane.confidence === 'number' ? lane.confidence : null,
-      priority: priority ? priority.score : null,
-      risk: risk ? risk.score : null,
-      size: size ? size.score : null,
+      lane_confidence: laneConfidence,
+      lane_fits: fits,
+      lane_fits_band: noulBand(fits),
+      lane_uncertain: (fits !== null && fits <= NOUL_YES_ABOVE) || (laneConfidence !== null && laneConfidence < CONFIDENCE_FLOOR),
+      priority: p,
+      priority_confidence: priority && typeof priority.confidence === 'number' ? priority.confidence : null,
+      risk: r,
+      size: s,
       independent: independent ? independent.noul >= 0.5 : null,
       conflicts: conflicts ? conflicts.noul >= 0.5 : null,
       conflict_probability: conflicts ? conflicts.noul : null,
+      composite,
     };
   });
 
-  // Execution order: higher priority first, lower risk first within a priority band.
-  workstreams.sort((a, b) => (b.priority ?? -1) - (a.priority ?? -1) || (a.risk ?? 99) - (b.risk ?? 99));
+  // Composite ordering: weighted normalized scores, highest first.
+  workstreams.sort((a, b) => (b.composite ?? -Infinity) - (a.composite ?? -Infinity));
 
   return {
     task: args.task,
     approach: answers.approach ? answers.approach.choice : null,
     task_complexity: answers.task_complexity ? answers.task_complexity.score : null,
+    weights,
     workstreams,
     parallel_safe: workstreams.filter((w) => w.independent === true && w.conflicts !== true).map((w) => w.id),
     needs_sequential: workstreams.filter((w) => w.independent === false || w.conflicts === true).map((w) => w.id),
     model: res.model,
     usage: res.usage,
     question_count: Object.keys(questions).length,
-    note: 'Host agent executes the plan with its own subagents/workers; Jev only made the structured decisions.',
+    note: 'Host agent executes the plan with its own subagents/workers; Jev only made the structured decisions. One request, all questions in parallel.',
   };
 }
 
 async function hRoute(args, client) {
   if (args.item === undefined || args.item === null) throw new TypeError('"item" is required.');
   if (!args.destinations) throw new TypeError('"destinations" (map of name -> description, or array of names) is required.');
-  const threshold = num(args.threshold, 0.6);
+  const threshold = num(args.threshold, 0.6); // probability-routing: threshold on the probability of the option you act on
+  const confidenceFloor = num(args.confidence_floor, CONFIDENCE_FLOOR); // confidence-routing: check confidence first
   const destinations = Array.isArray(args.destinations)
     ? Object.fromEntries(args.destinations.map((d) => [String(d), null]))
     : args.destinations;
   const questions = {
-    route: choice('Which destination should handle this item?', destinations),
-    // Companion Noul (https://docs.typesafe.ai/patterns/companion-noul.md):
-    // lets the caller tell when NO destination fits.
-    none_fit: noul('Does NONE of the destinations fit this item (answer yes if it needs a fallback, human review, or a new destination)?'),
+    route: choice('Which destination should handle this item? Reference fields of the item by name where useful.', destinations),
+    // companion noul (patterns/companion-noul.md): a Choice always picks one,
+    // even when nothing fits — this noul says whether any destination fits.
+    any_fit: noul('Does at least one of the listed destinations fit this item?'),
   };
   const res = await client.systemOne({ model: args.model, state: args.item, questions, timeoutMs: args.timeout_ms });
-  const r = (res.answers || {}).route || {};
-  const noneFit = (res.answers || {}).none_fit ? (res.answers || {}).none_fit.noul : null;
+  const answers = res.answers || {};
+  const r = answers.route || {};
+  const anyFit = answers.any_fit ? answers.any_fit.noul : null;
   const prob = r.probabilities && r.choice !== undefined ? r.probabilities[r.choice] : undefined;
   const confidence = typeof r.confidence === 'number' ? r.confidence : null;
+  const fitBand = noulBand(anyFit);
   const strength = prob ?? confidence ?? 0;
-  const act = strength >= threshold && (noneFit === null || noneFit < 0.5);
+  const confidentEnough = confidence === null || confidence >= confidenceFloor;
+  const act = strength >= threshold && fitBand === 'clear_yes' && confidentEnough;
+  let recommendation;
+  if (fitBand === 'clear_no') recommendation = 'no destination fits — use a fallback, human review, or add a destination';
+  else if (!confidentEnough) recommendation = `low confidence (${confidence}) — escalate to a person instead of auto-routing`;
+  else if (strength < threshold) recommendation = `probability ${strength} below threshold ${threshold} — clarify or escalate`;
+  else recommendation = `route to "${r.choice}"`;
   return {
     route: r.choice ?? null,
     probability: prob ?? null,
     confidence,
-    none_fit: noneFit,
+    any_fit: anyFit,
+    fit_band: fitBand,
     threshold,
+    confidence_floor: confidenceFloor,
     act,
-    recommendation: act ? `route to "${r.choice}"` : 'do not auto-route — low confidence or no destination fits; escalate or add a destination',
-    answers: res.answers,
+    recommendation,
+    answers,
     usage: res.usage,
     model: res.model,
   };
@@ -295,9 +376,10 @@ async function hRoute(args, client) {
 async function hReview(args, client) {
   if (args.output === undefined || args.output === null) throw new TypeError('"output" is required.');
   if (!Array.isArray(args.criteria) || args.criteria.length === 0) {
-    throw new TypeError('"criteria" must be a non-empty array of { id, check, threshold? }.');
+    throw new TypeError('"criteria" must be a non-empty array of { id, check, threshold?, fail_below? }.');
   }
-  const passThreshold = num(args.pass_threshold, 0.7);
+  const passThreshold = num(args.pass_threshold, NOUL_YES_ABOVE);
+  const failBelow = num(args.fail_below, NOUL_NO_BELOW);
   const questions = {};
   for (const c of args.criteria) {
     if (!c || !c.id || !c.check) throw new TypeError('each criterion needs { id, check }.');
@@ -316,17 +398,22 @@ async function hReview(args, client) {
     const a = answers[sanitizeId(c.id, 'check')];
     const p = a ? a.noul : null;
     const t = num(c.threshold, passThreshold);
-    return { id: c.id, check: c.check, noul: p, threshold: t, passed: p !== null ? p >= t : false };
+    const fb = num(c.fail_below, failBelow);
+    // three-band noul reading: >= threshold pass, < fail_below fail, else uncertain
+    const status = p === null || p === undefined ? 'unknown' : p >= t ? 'pass' : p < fb ? 'fail' : 'uncertain';
+    return { id: c.id, check: c.check, noul: p, threshold: t, fail_below: fb, status, passed: status === 'pass' };
   });
   const quality = answers.quality ? answers.quality.score : null;
+  const qualityConfidence = answers.quality && typeof answers.quality.confidence === 'number' ? answers.quality.confidence : null;
+  // confidence-routing on the quality score: check confidence first
+  const qualityUncertain = qualityConfidence !== null && qualityConfidence < CONFIDENCE_FLOOR;
   return {
     pass: checks.every((c) => c.passed),
     checks,
     quality,
-    quality_confidence: answers.quality && typeof answers.quality.confidence === 'number' ? answers.quality.confidence : null,
-    // Confidence routing (https://docs.typesafe.ai/patterns/confidence-routing.md):
-    // low-confidence answers should be re-checked by a stronger route instead of trusted.
-    needs_human_review: checks.some((c) => c.noul !== null && c.noul < 0.5),
+    quality_confidence: qualityConfidence,
+    quality_uncertain: quality ? qualityUncertain : null,
+    needs_human_review: checks.some((c) => c.status !== 'pass') || qualityUncertain,
     usage: res.usage,
     model: res.model,
   };
@@ -374,7 +461,7 @@ async function hBatch(args, client) {
     concurrency,
     results,
     total_usage: usage,
-    note: 'Each item got its own request; requests ran in parallel up to "concurrency". Per-item failures do not fail the batch.',
+    note: 'Each item has its OWN state, so each gets its own request (use jev_fan_out when many questions share ONE state); requests ran in parallel up to "concurrency". Per-item failures do not fail the batch.',
   };
 }
 
@@ -394,7 +481,13 @@ async function hBox(args, client) {
   }
   if (!['png', 'jpg', 'jpeg'].includes(format)) throw new TypeError('Image format must be png, jpg, or jpeg (PNG/JPEG only).');
   const assets = { img: { type: 'image', format, data_base64: buf.toString('base64') } };
-  const questions = { locate: box(String(args.instructions)) };
+  const target = String(args.instructions).replace(/"/g, "'");
+  const questions = {
+    locate: box(String(args.instructions)),
+    // a Box always returns a location — pair it with a Noul asking whether the
+    // target is in the image at all (docs.typesafe.ai/primitives).
+    present: noul(`Is the target described as "${target}" actually present and visible in the image \`img\`?`),
+  };
   const res = await client.systemOne({
     model: args.model,
     state: { image: 'img' }, // 'img' is the asset placeholder; it is replaced by the image bytes
@@ -403,14 +496,108 @@ async function hBox(args, client) {
     timeoutMs: args.timeout_ms,
   });
   const locate = (res.answers || {}).locate || {};
+  const present = (res.answers || {}).present || {};
+  const presentNoul = typeof present.noul === 'number' ? present.noul : null;
   return {
+    present: presentNoul,
+    present_band: noulBand(presentNoul),
     box: locate.box || null, // { left, top, right, bottom } as fractions of width/height from top-left
     confidence: typeof locate.confidence === 'number' ? locate.confidence : null,
     instructions: args.instructions,
     model: res.model,
     usage: res.usage,
-    note: 'Box answers are dreamer-ready/experimental. Edges are fractions of the image size, so they work at any resolution.',
+    note: 'Box answers are dreamer-ready/experimental and need Jev 1.14+. Edges are fractions of the image size. There is no recommended confidence threshold: if confidence is low, re-ask on a larger image or a higher-resolution crop, and pad the box edges before cropping so the target is not cut off. If present is clear_no, the box is meaningless.',
   };
+}
+
+/**
+ * Draft a closed option set with a SMALL generative LLM (default
+ * mistral-small-latest via the Mistral API). Jev never generates text
+ * (model jaggedness: "Generation"), so option sets for Choice criteria /
+ * route destinations / plan lanes are drafted here and Jev only PICKS from
+ * them. Requires MISTRAL_API_KEY; Jev decisions still need TYPESAFE_API_KEY.
+ */
+async function hDraftOptions(args) {
+  if (!args.topic || typeof args.topic !== 'string') throw new TypeError('"topic" (string) is required.');
+  const apiKey = process.env.MISTRAL_API_KEY || '';
+  if (!apiKey) {
+    throw new TypeError(
+      'MISTRAL_API_KEY is not set. jev_draft_options uses a lightweight generative model (default mistral-small-latest, ' +
+      'override with "model" / JEV_ROUTER_DRAFT_MODEL) ONLY to draft closed option sets for Choice criteria / destinations / lanes — ' +
+      'Jev still makes every decision. Set MISTRAL_API_KEY (https://console.mistral.ai) or write the options yourself and skip this tool.'
+    );
+  }
+  const base = String(process.env.MISTRAL_API_BASE || 'https://api.mistral.ai/v1').replace(/\/+$/, '');
+  const model = args.model || process.env.JEV_ROUTER_DRAFT_MODEL || 'mistral-small-latest';
+  const count = Math.min(64, Math.max(2, num(args.count, 8)));
+  const timeoutMs = num(args.timeout_ms, 30000);
+  const system =
+    'You draft closed option sets for a decision model (TypeSafe Jev, System One). You NEVER make the decision yourself; you only ' +
+    'propose a clear, mutually exclusive set of options, each with a one-line description usable as a Choice criterion. Reply with ' +
+    'STRICT JSON only, no markdown fences: {"options": [{"name": "snake_case_id", "description": "one line"}, ...]}. Produce exactly ' +
+    'the requested number of options unless fewer are genuinely distinct. Never include secrets, personal data, or credentials.';
+  const user = `Topic: ${args.topic}\n${args.context ? `Context:\n${String(args.context).slice(0, 4000)}\n` : ''}Propose up to ${count} options for a Choice question about this topic.`;
+  const body = {
+    model,
+    messages: [
+      { role: 'system', content: system },
+      { role: 'user', content: user },
+    ],
+    response_format: { type: 'json_object' },
+    temperature: 0.2,
+    max_tokens: 1024,
+  };
+  let lastErr;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+    let res;
+    try {
+      res = await fetch(`${base}/chat/completions`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: ctrl.signal,
+      });
+    } catch (err) {
+      clearTimeout(timer);
+      throw new Error(`Mistral draft request failed: ${err.name === 'AbortError' ? `timed out after ${timeoutMs}ms` : err.message}`);
+    }
+    clearTimeout(timer);
+    const text = await res.text();
+    if ((res.status === 429 || res.status >= 500) && attempt === 1) {
+      await new Promise((r) => setTimeout(r, 800));
+      continue;
+    }
+    if (!res.ok) throw new Error(`Mistral API error ${res.status} on POST /chat/completions: ${text.slice(0, 500)}`);
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      throw new Error(`Non-JSON response from Mistral: ${text.slice(0, 300)}`);
+    }
+    lastErr = null;
+    const content = (data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || '';
+    let parsed;
+    try {
+      parsed = JSON.parse(content);
+    } catch {
+      throw new Error(`Draft model did not return valid JSON: ${content.slice(0, 300)}`);
+    }
+    const options = Array.isArray(parsed.options) ? parsed.options.filter((o) => o && o.name) : [];
+    if (options.length === 0) throw new Error('Draft model returned no options.');
+    const criteria = {};
+    for (const o of options) criteria[String(o.name)] = o.description ?? null;
+    return {
+      draft_model: model,
+      topic: args.topic,
+      options,
+      criteria, // ready to pass as Choice criteria / destinations / lanes
+      usage: data.usage,
+      note: 'Options are proposals from a small generative LLM; Jev (System One) makes the actual decision. Review/edit before sending as Choice criteria, destinations, or lanes. Never send secrets to the draft model.',
+    };
+  }
+  throw lastErr || new Error('Mistral draft request failed.');
 }
 
 /* ---------- MCP tool catalogue ---------- */
@@ -419,7 +606,7 @@ const TOOLS = [
   {
     name: 'jev_models',
     description:
-      'List the TypeSafe System One models/aliases available to TYPESAFE_API_KEY (GET /v1/models) and the router default model.',
+      'List the TypeSafe System One models/aliases available to TYPESAFE_API_KEY (GET /v1/models), the router default model, and the model limits (context, pricing, Box requirements).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -433,14 +620,15 @@ const TOOLS = [
     description:
       'Ask the Jev System One model typed questions about a "state" in ONE request (POST /v1/systemone). ' +
       'Questions: { name: { type: "noul"|"choice"|"score"|"box", instructions, criteria? } }. ' +
-      'choice criteria = map of option->description; score criteria = array of ordered level descriptions (>=2); box needs an image asset. ' +
-      'Returns { model, answers, usage }. Answers are keyed by question name.',
+      'choice criteria = map of option->description; score criteria = array of ordered level descriptions (>=2); noul criteria = optional {true, false} descriptions; box needs an image asset. ' +
+      'instructions/criteria also accept objects/arrays (structured questions). ' +
+      'Returns { model, answers, usage }. Answers are keyed by question name; choice/score/box answers carry probabilities + confidence, noul answers carry just the noul probability.',
     inputSchema: {
       type: 'object',
       properties: {
-        model: { type: 'string', description: 'Model name/alias (default TYPESAFE_MODEL or jev-latest).' },
-        state: { description: 'Content to evaluate: a string or any JSON object.', },
-        questions: { type: 'object', description: 'Map of question name -> question ({type, instructions, criteria?}), or array of {id, type, instructions, criteria?}.' },
+        model: { type: 'string', description: 'Model name/alias (default TYPESAFE_MODEL or jev-latest). Pin a versioned ID (e.g. jev-1.14.0) if you tuned thresholds.' },
+        state: { description: 'Content to evaluate: a string or any JSON object/array.' },
+        questions: { type: 'object', description: 'Map of question name -> question ({type, instructions, criteria?}), or array of {id, type, instructions, criteria?}. Question IDs are for your code; write the full question in instructions and reference state fields by `path`.' },
         assets: { type: 'object', description: 'Optional image assets: { placeholder: { path } or { data_base64, format } }. Placeholder strings inside state/instructions are replaced by the image. Requires the images danger-zone header (JEV_ROUTER_ALLOW_IMAGES=true, default).' },
         headers: { type: 'object', description: 'Extra request headers (e.g. {"TypeSafe-Danger-Zone-Long-Context": "true"}).' },
         timeout_ms: { type: 'integer' },
@@ -452,9 +640,9 @@ const TOOLS = [
   {
     name: 'jev_fan_out',
     description:
-      'Speculative fan-out (https://docs.typesafe.ai/patterns/fan-out.md): send MANY questions about one state in a single request — ' +
-      'they are all evaluated in parallel, so extra (even speculative) questions cost little latency — then keep only the answers you need in code. ' +
-      'Optionally pass min_confidence to list answers below that confidence as discarded.',
+      'Speculative fan-out — the DEFAULT way to use Jev (https://docs.typesafe.ai/patterns/fan-out.md): send MANY questions about one state in a SINGLE request. ' +
+      'All questions are evaluated in parallel and there is no question-count limit (only context limits), so ask everything you might need and keep only the answers you use in code. ' +
+      'Optionally pass min_confidence to list answers below that confidence as discarded (noul_confidence=true also scores nouls via |2p-1|).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -464,6 +652,7 @@ const TOOLS = [
         assets: { type: 'object' },
         headers: { type: 'object' },
         min_confidence: { type: 'number', description: 'If set, answers with confidence below this are reported in discarded_below_confidence.' },
+        noul_confidence: { type: 'boolean', description: 'With min_confidence: also score noul answers as |2*noul-1| (nouls carry no confidence of their own).' },
         timeout_ms: { type: 'integer' },
       },
       required: ['state', 'questions'],
@@ -474,8 +663,9 @@ const TOOLS = [
     name: 'jev_plan_workstreams',
     description:
       'Open parallel workstreams for a task: the host agent proposes candidate workstreams, and ONE speculative fan-out request asks Jev ' +
-      'per candidate for lane (choice), priority/risk/size (scores), independence and conflict risk (nouls), plus a global approach (parallel/sequential/hybrid). ' +
-      'Returns a structured plan: ordered workstreams, parallel_safe ids, needs_sequential ids, usage. The host agent then executes the plan with its own subagents.',
+      'per candidate for lane (choice + companion noul), priority/risk/size (scores), independence and conflict risk (nouls), plus a global approach (parallel/sequential/hybrid). ' +
+      'Atomic scores are combined with "weights" in code (composite scoring). ' +
+      'Returns a structured plan: workstreams ordered by composite score, parallel_safe ids, needs_sequential ids, lane_uncertain flags, usage. The host agent then executes the plan with its own subagents.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -485,8 +675,9 @@ const TOOLS = [
           description: 'Candidate workstreams: strings or { id?, description } objects. Max 24 by default (max_candidates).',
           items: {},
         },
-        files: { type: 'array', items: { type: 'string' }, description: 'Repo files (relative to cwd) to include as context, capped by MAX_CONTEXT_CHARS.' },
-        lanes: { type: 'object', description: 'Override the default lane map { lane: description }.' },
+        files: { type: 'array', items: { type: 'string' }, description: 'Repo files (relative to cwd) to include as context. Keep state lean — Jev suffers context rot; capped by MAX_CONTEXT_CHARS (default 120000; Jev limits are 64k tokens/request and 32k/question).' },
+        lanes: { type: 'object', description: 'Override the default lane map { lane: description }. Tip: draft with jev_draft_options.' },
+        weights: { type: 'object', description: 'Composite-scoring weights { priority, risk, size } (default { priority: 1, risk: -1, size: 0 }); scores are normalized to 0..1 and combined in code.' },
         max_candidates: { type: 'integer' },
         model: { type: 'string' },
         timeout_ms: { type: 'integer' },
@@ -498,14 +689,16 @@ const TOOLS = [
   {
     name: 'jev_route',
     description:
-      'Route one item to a destination: a Choice over destinations plus a companion Noul ("none fit"), combined with a probability/confidence ' +
-      'threshold (https://docs.typesafe.ai/patterns/probability-routing.md). Returns { route, probability, confidence, act, recommendation, answers, usage }.',
+      'Route one item to a destination: a Choice over destinations plus a companion any_fit Noul (patterns/companion-noul.md). ' +
+      'Acts only when the probability of the chosen destination clears "threshold" (probability-routing), the companion noul is a clear yes (>0.7), and confidence clears "confidence_floor" (confidence-routing; default 0.5). ' +
+      'Returns { route, probability, confidence, any_fit, fit_band, act, recommendation, answers, usage }.',
     inputSchema: {
       type: 'object',
       properties: {
         item: { description: 'The thing to route (string or JSON object): ticket, PR, file, message...' },
-        destinations: { description: 'Map of destination name -> description, or array of names.' },
-        threshold: { type: 'number', description: 'Min probability (or confidence) of the chosen destination to auto-route (default 0.6).' },
+        destinations: { description: 'Map of destination name -> description, or array of names. Tip: draft with jev_draft_options.' },
+        threshold: { type: 'number', description: 'Min probability of the chosen destination to auto-route (default 0.6). Riskier actions deserve higher thresholds.' },
+        confidence_floor: { type: 'number', description: 'Min choice confidence to auto-route (default 0.5); below it, escalate (confidence-routing).' },
         model: { type: 'string' },
         timeout_ms: { type: 'integer' },
       },
@@ -517,14 +710,16 @@ const TOOLS = [
     name: 'jev_review',
     description:
       'Verify a workstream output against acceptance criteria: one Noul per criterion plus an optional overall quality Score, ' +
-      'with per-check thresholds (default pass_threshold 0.7). Returns { pass, checks[], quality, needs_human_review, usage }.',
+      'with three-band noul reading (pass >= pass_threshold 0.7, fail < fail_below 0.3, else "uncertain") and a confidence check on the quality score (confidence-routing). ' +
+      'Returns { pass, checks[] with status, quality, quality_confidence, needs_human_review, usage }.',
     inputSchema: {
       type: 'object',
       properties: {
         output: { description: 'The output to verify (string or JSON object): diff, report, answer...' },
-        criteria: { type: 'array', items: { type: 'object', properties: { id: { type: 'string' }, check: { type: 'string' }, threshold: { type: 'number' } }, required: ['id', 'check'] } },
+        criteria: { type: 'array', items: { type: 'object', properties: { id: { type: 'string' }, check: { type: 'string' }, threshold: { type: 'number' }, fail_below: { type: 'number' } }, required: ['id', 'check'] } },
         rubric: { type: 'array', items: { type: 'string' }, description: 'Optional ordered quality levels (>=2) for one overall Score question.' },
-        pass_threshold: { type: 'number', description: 'Default per-check Noul threshold (default 0.7).' },
+        pass_threshold: { type: 'number', description: 'Per-check noul threshold for "pass" (default 0.7).' },
+        fail_below: { type: 'number', description: 'Per-check noul below which the check "fails" (default 0.3); between fail_below and pass_threshold it is "uncertain".' },
         model: { type: 'string' },
         timeout_ms: { type: 'integer' },
       },
@@ -535,8 +730,8 @@ const TOOLS = [
   {
     name: 'jev_batch',
     description:
-      'Offload MANY independent items to Jev in parallel: each item has its own state + questions and gets its own request; ' +
-      'requests run concurrently up to "concurrency" (default 6, max 16). Per-item failures are reported, not fatal. Returns per-item answers + total usage.',
+      'Offload MANY independent items to Jev in parallel. Use when each item has its OWN state (each gets its own request — when many questions share ONE state, use jev_fan_out instead). ' +
+      'Requests run concurrently up to "concurrency" (default 6, max 16). Per-item failures are reported, not fatal. Returns per-item answers + total usage.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -566,18 +761,38 @@ const TOOLS = [
   {
     name: 'jev_box',
     description:
-      'Locate something in an image with the Box primitive (https://docs.typesafe.ai/primitives/box.md): sends the image as an asset ' +
-      '(with the experimental images header) and one box question. Returns { box: {left, top, right, bottom} } as fractions of the image size, plus confidence. Dreamer-ready/experimental.',
+      'Locate something in an image with the Box primitive (https://docs.typesafe.ai/primitives/box.md; needs Jev 1.14+ and the experimental images header): sends the image as an asset ' +
+      'plus one box question AND a companion "present" Noul (a Box always returns a location, so check the target is actually in the image). ' +
+      'Returns { present, present_band, box: {left, top, right, bottom}, confidence } — edges are fractions of the image size.',
     inputSchema: {
       type: 'object',
       properties: {
         image: { type: 'string', description: 'Path to a PNG/JPEG file (relative to cwd) or base64 data.' },
         instructions: { type: 'string', description: 'What to locate, e.g. "the submit button in `img`" (does not have to be a question).' },
         format: { type: 'string', enum: ['png', 'jpg', 'jpeg'], description: 'Image format; auto-detected from bytes/extension when omitted.' },
-        model: { type: 'string' },
+        model: { type: 'string', description: 'Use a Jev 1.14+ model (jev-latest default).' },
         timeout_ms: { type: 'integer' },
       },
       required: ['image', 'instructions'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'jev_draft_options',
+    description:
+      'Draft a closed option set for Choice criteria / route destinations / plan lanes using a SMALL generative LLM (default mistral-small-latest via the Mistral API; override with "model" / JEV_ROUTER_DRAFT_MODEL). ' +
+      'Jev never generates text (model jaggedness), so options are drafted here and Jev only picks from them. Requires MISTRAL_API_KEY. ' +
+      'Returns { draft_model, options: [{name, description}], criteria } ready to pass as Choice criteria. Never send secrets to the draft model.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        topic: { type: 'string', description: 'What the option set is for, e.g. "support ticket categories" or "lanes for a coding task".' },
+        context: { type: 'string', description: 'Optional extra context (domain, existing labels, constraints).' },
+        count: { type: 'integer', description: 'Number of options to propose (default 8, max 64).' },
+        model: { type: 'string', description: 'Draft model (default JEV_ROUTER_DRAFT_MODEL or mistral-small-latest).' },
+        timeout_ms: { type: 'integer', description: 'Default 30000.' },
+      },
+      required: ['topic'],
       additionalProperties: false,
     },
   },
@@ -592,6 +807,7 @@ const HANDLERS = {
   jev_review: hReview,
   jev_batch: hBatch,
   jev_box: hBox,
+  jev_draft_options: hDraftOptions,
 };
 
 /** Call a tool by name; returns a plain object (the MCP layer stringifies it). */

@@ -120,6 +120,31 @@ test('CLI box reads an image file and returns box coordinates', async () => {
   }
 });
 
+test('CLI draft-options drafts criteria via a mock Mistral endpoint (mistral-small-latest default)', async () => {
+  const { url, close } = await startMock((req) => {
+    if (req.url === '/v1/chat/completions') {
+      const b = JSON.parse(req.body);
+      assert.equal(b.model, 'mistral-small-latest');
+      return { body: { model: b.model, choices: [{ message: { content: JSON.stringify({ options: [
+        { name: 'billing', description: 'Charges/refunds' }, { name: 'technical', description: 'Bugs' },
+      ] }) } }], usage: { prompt_tokens: 40, completion_tokens: 15 } } };
+    }
+    return { status: 404, body: {} };
+  });
+  try {
+    const r = await runCli(['draft-options', '--topic', 'ticket categories', '--count', '5', '--compact'], {
+      MISTRAL_API_KEY: 'mk',
+      MISTRAL_API_BASE: `${url}/v1`,
+    });
+    assert.equal(r.status, 0, r.stderr);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.draft_model, 'mistral-small-latest');
+    assert.deepEqual(Object.keys(out.criteria), ['billing', 'technical']);
+  } finally {
+    await close();
+  }
+});
+
 test('CLI without API key exits 1 with the actionable error on stderr', () => {
   const r = runCliSync(['models'], { TYPESAFE_API_KEY: '' });
   assert.equal(r.status, 1);

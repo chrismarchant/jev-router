@@ -32,6 +32,11 @@ node bin/jev-router.js fan-out --state "I was charged twice. Please refund ASAP.
   "urgent":   {"type":"noul","instructions":"Is it urgent?"}
 }'
 
-# 6. Box: locate an element in a screenshot (experimental images header)
+# 6. Box: locate an element in a screenshot (experimental images header, needs Jev 1.14+)
 node bin/jev-router.js box --image screenshot.png --instructions "the red error banner in `img`"
+
+# 7. Draft a closed option set with a small LLM (Jev never generates text, it only picks)
+#    Requires MISTRAL_API_KEY; default draft model is mistral-small-latest.
+node bin/jev-router.js draft-options --topic "lanes for a coding task" --count 8
+# -> feed the returned "criteria" into: plan --lanes, route --destinations, or ask --questions
 ```

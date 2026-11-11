@@ -42,7 +42,7 @@ function mcpSession(env, messages) {
   });
 }
 
-test('MCP handshake: initialize + tools/list exposes 8 jev_* tools', async () => {
+test('MCP handshake: initialize + tools/list exposes 9 jev_* tools', async () => {
   const { responses } = await mcpSession(
     { TYPESAFE_API_KEY: 'test-key' },
     [
@@ -56,7 +56,7 @@ test('MCP handshake: initialize + tools/list exposes 8 jev_* tools', async () =>
   assert.equal(init.result.serverInfo.name, 'jev-router');
   assert.equal(init.result.protocolVersion, '2025-06-18');
   const list = responses.find((r) => r.id === 2);
-  assert.equal(list.result.tools.length, 8);
+  assert.equal(list.result.tools.length, 9);
   assert.ok(list.result.tools.every((t) => t.name.startsWith('jev_')));
   const ping = responses.find((r) => r.id === 3);
   assert.deepEqual(ping.result, {});

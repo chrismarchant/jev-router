@@ -14,6 +14,10 @@
  *   jev-router review   --output <text|json|@file> --criteria <json|@file> [--rubric <json|@file>] [--pass-threshold 0.7]
  *   jev-router batch    --items <json|@file> [--concurrency N] [--model M]
  *   jev-router box      --image <path|base64> --instructions <text> [--format png|jpg|jpeg]
+ *   jev-router draft-options --topic <text> [--context <text>] [--count N] [--model M]
+ *               Draft a closed option set (Choice criteria / destinations / lanes) with a
+ *               small generative LLM (default mistral-small-latest, needs MISTRAL_API_KEY);
+ *               Jev never generates text, so it only PICKS from these options.
  *
  * Values prefixed with @ are read from a file. Requires TYPESAFE_API_KEY
  * (https://console.typesafe.ai/keys). Env overrides: TYPESAFE_API_BASE,
@@ -38,6 +42,7 @@ Commands:
   review      Verify an output: --output + --criteria [--rubric JSON] [--pass-threshold F]
   batch       Many items in parallel: --items <json|@file> [--concurrency N]
   box         Locate something in an image: --image <path|base64> --instructions <text>
+  draft-options  Draft Choice criteria/destinations/lanes with a small LLM: --topic <text> [--context T] [--count N] [--model M] (needs MISTRAL_API_KEY; default model mistral-small-latest)
   help        Show this help
 
 Options:
@@ -48,7 +53,8 @@ Options:
 
 Env: TYPESAFE_API_KEY (required), TYPESAFE_API_BASE, TYPESAFE_MODEL,
      JEV_ROUTER_TIMEOUT_MS, JEV_ROUTER_MAX_RETRIES, JEV_ROUTER_CONCURRENCY,
-     JEV_ROUTER_ALLOW_IMAGES, JEV_ROUTER_LONG_CONTEXT, MAX_CONTEXT_CHARS
+     JEV_ROUTER_ALLOW_IMAGES, JEV_ROUTER_LONG_CONTEXT, MAX_CONTEXT_CHARS,
+     MISTRAL_API_KEY + MISTRAL_API_BASE + JEV_ROUTER_DRAFT_MODEL (draft-options only)
 
 Examples:
   jev-router models
@@ -58,6 +64,7 @@ Examples:
     --files '["src/server.js"]'
   jev-router batch --items @examples/triage-items.json
   jev-router box --image screenshot.png --instructions "the error banner in \`img\`"
+  jev-router draft-options --topic "support ticket categories" --count 8   # needs MISTRAL_API_KEY
 `;
 
 function parseArgs(argv) {
@@ -199,13 +206,23 @@ async function main() {
         timeout_ms: numOpt(opts, 'timeout-ms'),
       };
       break;
+    case 'draft-options':
+    case 'draft_options':
+      args = {
+        topic: textOrJsonOpt(opts, 'topic', 0),
+        context: opts.context === true ? undefined : opts.context,
+        count: numOpt(opts, 'count'),
+        model: opts.model === true ? undefined : opts.model,
+        timeout_ms: numOpt(opts, 'timeout-ms'),
+      };
+      break;
     default:
       process.stderr.write(`Unknown command: ${cmd}\n\n${USAGE}`);
       process.exit(2);
   }
 
   const result = await callTool(
-    { models: 'jev_models', ask: 'jev_ask', 'fan-out': 'jev_fan_out', fanout: 'jev_fan_out', plan: 'jev_plan_workstreams', route: 'jev_route', review: 'jev_review', batch: 'jev_batch', box: 'jev_box' }[cmd],
+    { models: 'jev_models', ask: 'jev_ask', 'fan-out': 'jev_fan_out', fanout: 'jev_fan_out', plan: 'jev_plan_workstreams', route: 'jev_route', review: 'jev_review', batch: 'jev_batch', box: 'jev_box', 'draft-options': 'jev_draft_options', draft_options: 'jev_draft_options' }[cmd],
     args,
     client
   );

@@ -21,8 +21,8 @@ echo "$OUT" | grep -q '"serverInfo":{"name":"jev-router"' && echo "OK: initializ
 TOOLS="$(echo "$OUT" | grep '"id":2' | grep -o '"name":"jev_[a-z_]*"' | sort -u | tr '\n' ' ')"
 echo "tools: $TOOLS"
 N="$(echo $TOOLS | wc -w | tr -d ' ')"
-if [ "$N" -ne 8 ]; then echo "FAIL: expected 8 jev_* tools, got $N"; exit 1; fi
-echo "OK: 8 jev_* tools listed"
+if [ "$N" -ne 9 ]; then echo "FAIL: expected 9 jev_* tools, got $N"; exit 1; fi
+echo "OK: 9 jev_* tools listed"
 
 echo "== 3. missing-key error =="
 if [ -z "${TYPESAFE_API_KEY:-}" ]; then
